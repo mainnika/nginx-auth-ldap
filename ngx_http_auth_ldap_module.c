@@ -108,6 +108,7 @@ typedef struct {
     ngx_array_t *servers;        /* array of ngx_http_auth_ldap_server_t */
     ngx_flag_t cache_enabled;
     ngx_msec_t cache_expiration_time;
+    ngx_msec_t cache_limit_time;
     size_t cache_size;
     ngx_int_t servers_size;
 #if (NGX_OPENSSL)
@@ -123,7 +124,8 @@ typedef struct {
 typedef struct {
     uint32_t small_hash;     /* murmur2 hash of username ^ &server       */
     uint32_t outcome;        /* OUTCOME_DENY or OUTCOME_ALLOW            */
-    ngx_msec_t time;         /* ngx_current_msec when created            */
+    ngx_msec_t used_time;    /* ngx_current_msec when used               */
+    ngx_msec_t created_time; /* ngx_current_msec when created            */
     u_char big_hash[16];     /* md5 hash of (username, server, password) */
 } ngx_http_auth_ldap_cache_elt_t;
 
@@ -132,6 +134,7 @@ typedef struct {
     ngx_uint_t num_buckets;
     ngx_uint_t elts_per_bucket;
     ngx_msec_t expiration_time;
+    ngx_msec_t limit_time;
 } ngx_http_auth_ldap_cache_t;
 
 typedef enum {
@@ -251,6 +254,14 @@ static ngx_command_t ngx_http_auth_ldap_commands[] = {
         ngx_conf_set_msec_slot,
         NGX_HTTP_MAIN_CONF_OFFSET,
         offsetof(ngx_http_auth_ldap_main_conf_t, cache_expiration_time),
+        NULL
+    },
+    {
+        ngx_string("auth_ldap_cache_limit_time"),
+        NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1,
+        ngx_conf_set_msec_slot,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_auth_ldap_main_conf_t, cache_limit_time),
         NULL
     },
     {
@@ -764,6 +775,7 @@ ngx_http_auth_ldap_create_main_conf(ngx_conf_t *cf)
 
     conf->cache_enabled = NGX_CONF_UNSET;
     conf->cache_expiration_time = NGX_CONF_UNSET_MSEC;
+    conf->cache_limit_time = NGX_CONF_UNSET_MSEC;
     conf->cache_size = NGX_CONF_UNSET_SIZE;
     conf->servers_size = NGX_CONF_UNSET;
 
@@ -793,8 +805,15 @@ ngx_http_auth_ldap_init_main_conf(ngx_conf_t *cf, void *parent)
     if (conf->cache_expiration_time == NGX_CONF_UNSET_MSEC) {
         conf->cache_expiration_time = 10000;
     }
+    if (conf->cache_limit_time == NGX_CONF_UNSET_MSEC) {
+        conf->cache_limit_time = 10000;
+    }
     if (conf->cache_expiration_time < 1000) {
         ngx_conf_log_error(NGX_LOG_ERR, cf, 0, "http_auth_ldap: auth_ldap_cache_expiration_time cannot be smaller than 1000 ms.");
+        return NGX_CONF_ERROR;
+    }
+    if (conf->cache_limit_time < 1000) {
+        ngx_conf_log_error(NGX_LOG_ERR, cf, 0, "http_auth_ldap: auth_ldap_cache_limit_time cannot be smaller than 1000 ms.");
         return NGX_CONF_ERROR;
     }
 
@@ -906,6 +925,7 @@ ngx_http_auth_ldap_init_cache(ngx_cycle_t *cycle)
 
     cache = &ngx_http_auth_ldap_cache;
     cache->expiration_time = conf->cache_expiration_time;
+    cache->limit_time = conf->cache_limit_time;
     cache->num_buckets = count;
     cache->elts_per_bucket = 8;
 
@@ -927,7 +947,8 @@ ngx_http_auth_ldap_check_cache_and_update(ngx_http_request_t *r, ngx_http_auth_l
 {
     ngx_http_auth_ldap_cache_elt_t *elt;
     ngx_md5_t md5ctx;
-    ngx_msec_t time_limit;
+    ngx_msec_t used_time_when_expired;
+    ngx_msec_t created_time_when_expired;
     ngx_uint_t i;
 
     ctx->cache_small_hash = ngx_murmur_hash2(r->headers_in.user.data, r->headers_in.user.len) ^ (uint32_t) (ngx_uint_t) server;
@@ -941,12 +962,14 @@ ngx_http_auth_ldap_check_cache_and_update(ngx_http_request_t *r, ngx_http_auth_l
     ctx->cache_bucket = &cache->buckets[ctx->cache_small_hash % cache->num_buckets];
 
     elt = ctx->cache_bucket;
-    time_limit = ngx_current_msec - cache->expiration_time;
+    used_time_when_expired = ngx_current_msec - cache->expiration_time;
+    created_time_when_expired = ngx_current_msec - cache->limit_time;
     for (i = 0; i < cache->elts_per_bucket; i++, elt++) {
         if (elt->small_hash == ctx->cache_small_hash &&
-                elt->time > time_limit &&
+                elt->used_time > used_time_when_expired &&
+                elt->created_time > created_time_when_expired &&
                 memcmp(elt->big_hash, ctx->cache_big_hash, 16) == 0) {
-            elt->time = ngx_current_msec; // update time as we've just used this entry
+            elt->used_time = ngx_current_msec; // update time as we've just used this entry
             return elt->outcome;
         }
     }
@@ -955,7 +978,7 @@ ngx_http_auth_ldap_check_cache_and_update(ngx_http_request_t *r, ngx_http_auth_l
 }
 
 static void
-ngx_http_auth_ldap_update_cache(ngx_http_auth_ldap_ctx_t *ctx,
+ngx_http_auth_ldap_set_cache(ngx_http_auth_ldap_ctx_t *ctx,
         ngx_http_auth_ldap_cache_t *cache, ngx_flag_t outcome)
 {
     ngx_http_auth_ldap_cache_elt_t *elt, *oldest_elt;
@@ -964,12 +987,13 @@ ngx_http_auth_ldap_update_cache(ngx_http_auth_ldap_ctx_t *ctx,
     elt = ctx->cache_bucket;
     oldest_elt = elt;
     for (i = 1; i < cache->elts_per_bucket; i++, elt++) {
-        if (elt->time < oldest_elt->time) {
+        if (elt->used_time < oldest_elt->used_time) {
             oldest_elt = elt;
         }
     }
 
-    oldest_elt->time = ngx_current_msec;
+    oldest_elt->created_time = ngx_current_msec;
+    oldest_elt->used_time = ngx_current_msec;
     oldest_elt->outcome = outcome;
     oldest_elt->small_hash = ctx->cache_small_hash;
     ngx_memcpy(oldest_elt->big_hash, ctx->cache_big_hash, 16);
@@ -2037,7 +2061,7 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
 
                 if (ngx_http_auth_ldap_cache.buckets != NULL && ctx->outcome == OUTCOME_ALLOW) {
                     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Caching outcome OUTCOME_CACHED_ALLOW=%d", OUTCOME_CACHED_ALLOW);
-                    ngx_http_auth_ldap_update_cache(ctx, &ngx_http_auth_ldap_cache, OUTCOME_CACHED_ALLOW);
+                    ngx_http_auth_ldap_set_cache(ctx, &ngx_http_auth_ldap_cache, OUTCOME_CACHED_ALLOW);
                 }
 
                 if (ctx->outcome == OUTCOME_ALLOW || ctx->outcome == OUTCOME_CACHED_ALLOW) {
