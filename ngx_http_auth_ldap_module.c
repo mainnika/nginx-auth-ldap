@@ -922,7 +922,7 @@ ngx_http_auth_ldap_init_cache(ngx_cycle_t *cycle)
 }
 
 static ngx_int_t
-ngx_http_auth_ldap_check_cache(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx,
+ngx_http_auth_ldap_check_cache_and_update(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx,
     ngx_http_auth_ldap_cache_t *cache, ngx_http_auth_ldap_server_t *server)
 {
     ngx_http_auth_ldap_cache_elt_t *elt;
@@ -946,6 +946,7 @@ ngx_http_auth_ldap_check_cache(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
         if (elt->small_hash == ctx->cache_small_hash &&
                 elt->time > time_limit &&
                 memcmp(elt->big_hash, ctx->cache_big_hash, 16) == 0) {
+            elt->time = ngx_current_msec; // update time as we've just used this entry
             return elt->outcome;
         }
     }
@@ -1894,10 +1895,10 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 if (ngx_http_auth_ldap_cache.buckets != NULL) {
                     for (i = 0; i < conf->servers->nelts; i++) {
                         s = &((ngx_http_auth_ldap_server_t *) conf->servers->elts)[i];
-                        rc = ngx_http_auth_ldap_check_cache(r, ctx, &ngx_http_auth_ldap_cache, s);
+                        rc = ngx_http_auth_ldap_check_cache_and_update(r, ctx, &ngx_http_auth_ldap_cache, s);
                         ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Using cached outcome %d from server %d", rc, i);
-                        if (rc == OUTCOME_DENY || rc == OUTCOME_ALLOW) {
-                            ctx->outcome = (rc == OUTCOME_DENY ? OUTCOME_CACHED_DENY : OUTCOME_CACHED_ALLOW);
+                        if (rc == OUTCOME_CACHED_ALLOW) {
+                            ctx->outcome = OUTCOME_CACHED_ALLOW;
                             ctx->phase = PHASE_NEXT;
                             goto loop;
                         }
@@ -2034,10 +2035,9 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                     ngx_http_auth_ldap_return_connection(ctx->c);
                 }
 
-                if (ngx_http_auth_ldap_cache.buckets != NULL &&
-                    (ctx->outcome == OUTCOME_DENY || ctx->outcome == OUTCOME_ALLOW)) {
-                    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Caching outcome %d", ctx->outcome);
-                    ngx_http_auth_ldap_update_cache(ctx, &ngx_http_auth_ldap_cache, ctx->outcome);
+                if (ngx_http_auth_ldap_cache.buckets != NULL && ctx->outcome == OUTCOME_ALLOW) {
+                    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Caching outcome OUTCOME_CACHED_ALLOW=%d", OUTCOME_CACHED_ALLOW);
+                    ngx_http_auth_ldap_update_cache(ctx, &ngx_http_auth_ldap_cache, OUTCOME_CACHED_ALLOW);
                 }
 
                 if (ctx->outcome == OUTCOME_ALLOW || ctx->outcome == OUTCOME_CACHED_ALLOW) {
